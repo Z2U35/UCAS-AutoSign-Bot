@@ -90,6 +90,34 @@ node scripts/test-wecom.mjs --account zs
   <img src="./doc/img/wecom-bot.jpg" alt="个人微信斜杠指令交互界面" width="360" />
 </p>
 
+## 用 Claude Code / Codex 一键部署
+
+如果你在服务器上装了 **Claude Code** 或 **Codex**（或者通过本地 Agent SSH 连上你的 VPS），可以直接把下面这段 Prompt 发给它，让它一步步带你装好网页端、定时调度和企业微信机器人：
+
+````text
+请帮我在当前 Linux 服务器上完整部署 https://github.com/Z2U35/UCAS-AutoSign-Bot （包含网页端、systemd 定时自动签到和企业微信个人微信机器人）。请先阅读仓库里的 README.md、doc/deployment.md 和 config/example.json，严格遵守以下流程分步执行：
+
+1. 环境检查与信息收集：
+   - 检查系统环境：确保安装 Node.js 24（本项目依赖内置 node:sqlite）、git，并查看当前服务器已有的反向代理（Nginx / OpenResty / Caddy）及服务器公网出口 IPv4。
+   - 向我询问确认以下信息后再动手修改配置：
+     a) 准备绑定的 HTTPS 域名；
+     b) 国科大 iClass 学生登录密码（studentPassword）以及需要添加的学生列表（英文缩写 name + 15 位学号 studentId）；
+     c) 是否启用企业微信机器人（若启用，请引导我去企业微信后台创建自建应用，提供 corpId、agentId 和 corpSecret）。
+   - 安全要求：严禁将密码或密钥提交到 Git，config/private.json 权限必须保持 0600。
+
+2. 部署服务与定时调度：
+   - 按 doc/deployment.md 拉取仓库、安装依赖（npm ci）并完成生产构建（npm run build）。
+   - 运行 scripts/setup-access.mjs 生成网页访问密码（提醒我保存 config/access-password.txt 中的口令后将该文件删除），并写入 config/private.json。
+   - 运行 scripts/setup-auto-sign.mjs 生成机器密钥，配置 /etc/ucas-signin/auto-sign.env（初始先设为 dry-run），安装并启动 ucas-signin.service（仅监听 127.0.0.1）和 ucas-auto-sign.timer。
+   - 配置 HTTPS 反向代理指向本机监听端口，确保公网 HTTPS 访问正常。
+
+3. 引导打通企业微信与个人微信「/」指令机器人：
+   - 引导我在企业微信后台「应用管理 -> 自建应用 -> API 接收消息」中点击随机生成 Token 和 EncodingAESKey 发给你写入 config/private.json。
+   - 让我填好回调地址 https://<我的域名>/api/wecom/callback 保存通过验证后，再把你查到的服务器出口 IP 填入「企业可信 IP」。
+   - 引导我在「我的企业 -> 微信插件」扫码关注后，直接在个人微信「签到」对话框发送 /id 获取我的企业微信 UserID，帮我填入 private.json 的 adminUserIds 和对应学生的 wecomUserId。
+   - 运行 node scripts/test-wecom.mjs 验证个人微信能收到测试推送，并在微信里实测 /help 和 /c 正常回复后，将 UCAS_AUTO_SIGN_MODE 切换为 live 并重启服务。
+````
+
 ## 本地跑起来
 
 需要 **Node.js 24**（直接用了内置的 `node:sqlite`，不用额外装 SQLite 驱动或数据库服务）。
