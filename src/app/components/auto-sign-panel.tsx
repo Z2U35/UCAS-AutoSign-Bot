@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Check, RefreshCw, X } from "lucide-react";
-import { AUTO_SIGN_RECORD_LIMIT, type AutoSignTask } from "@/lib/auto-sign/types";
+import { AUTO_SIGN_DISPLAY_HISTORY_LIMIT, AUTO_SIGN_HISTORY_LIMIT, type AutoSignTask } from "@/lib/auto-sign/types";
 import { Button, SectionHeading, StatusNotice } from "./editorial-ui";
 import { canCancelAutoSignTask, getAutoSignReason, getAutoSignStatusLabel, type AutoSignController } from "./use-auto-sign";
 
@@ -246,7 +246,7 @@ export default function AutoSignPanel({ controller }: { controller: AutoSignCont
 					<h3 id="auto-sign-history-title" className="font-serif text-xl font-bold">自动签到记录</h3>
 					<p className="field-help">全部账号 · 北京时间{snapshot && ` · ${tasks.length} 条`}</p>
 				</div>
-				<p className="field-help">按最近更新保留 {AUTO_SIGN_RECORD_LIMIT} 条（含未结束任务），更早的任务与记录会自动删除。</p>
+				<p className="field-help">展示全部待执行任务及最近 {AUTO_SIGN_DISPLAY_HISTORY_LIMIT} 条历史记录（数据库保留最近 {AUTO_SIGN_HISTORY_LIMIT} 条已结束记录，未结束任务永不自动清理）。</p>
 				{tasks.length > 0 ? (
 					<ul className="mt-3 space-y-3">
 						{tasks.map((task) => <li key={task.id}><AutoSignTaskRecord task={task} controller={controller} /></li>)}

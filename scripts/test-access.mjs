@@ -305,39 +305,44 @@ try {
 	console.log("PASS: terminal card deletion persists across snapshots, is idempotent, and rejects active, unauthenticated and cross-origin requests");
 
 	assert.equal((await request("/api/auto-sign/accounts", { accountId: "beta", enabled: true }, freshCookie)).status, 200);
-	const retainedCreations = [];
-	for (let taskIndex = 0; taskIndex < 22; taskIndex += 1) {
-		await writeFile(mockClockPath, String(preview.scheduledAt + 1000 + taskIndex));
-		const selectedDate = `2026-10-${String(taskIndex + 1).padStart(2, "0")}`;
+	const earlyPendingTasks = [];
+	for (let dayIndex = 0; dayIndex < 10; dayIndex += 1) {
+		await writeFile(mockClockPath, String(preview.scheduledAt + 1000 + dayIndex));
+		const selectedDate = `2026-10-${String(dayIndex + 1).padStart(2, "0")}`;
 		const createdResponse = await request("/api/auto-sign/tasks", {
-			accountId: taskIndex % 2 === 0 ? "alpha" : "beta", date: selectedDate, courseSchedId: "1234567",
+			accountId: dayIndex % 2 === 0 ? "alpha" : "beta", date: selectedDate, courseSchedId: "1234567",
+			expectedClassBeginAt: Date.parse(`${selectedDate}T08:30:00+08:00`),
+			expectedClassEndAt: Date.parse(`${selectedDate}T10:10:00+08:00`),
+		}, freshCookie);
+		assert.equal(createdResponse.status, 200);
+		earlyPendingTasks.push((await createdResponse.json()).task);
+	}
+	const cancelledHistory = [];
+	for (let histIndex = 0; histIndex < 25; histIndex += 1) {
+		await writeFile(mockClockPath, String(preview.scheduledAt + 2000 + histIndex));
+		const selectedDate = `2026-11-${String(histIndex + 1).padStart(2, "0")}`;
+		const createdResponse = await request("/api/auto-sign/tasks", {
+			accountId: histIndex % 2 === 0 ? "alpha" : "beta", date: selectedDate, courseSchedId: "1234567",
 			expectedClassBeginAt: Date.parse(`${selectedDate}T08:30:00+08:00`),
 			expectedClassEndAt: Date.parse(`${selectedDate}T10:10:00+08:00`),
 		}, freshCookie);
 		assert.equal(createdResponse.status, 200);
 		const createdTask = (await createdResponse.json()).task;
-		retainedCreations.push(createdTask);
-		if (taskIndex % 2 === 1) {
-			assert.equal((await request("/api/auto-sign/tasks/cancel", { taskId: createdTask.id }, freshCookie)).status, 200);
-		}
+		assert.equal((await request("/api/auto-sign/tasks/cancel", { taskId: createdTask.id }, freshCookie)).status, 200);
+		cancelledHistory.push(createdTask);
 	}
 	const retainedSnapshot = await (await request("/api/auto-sign", undefined, freshCookie)).json();
-	const expectedTaskIds = retainedCreations.slice(-20).reverse().map((task) => task.id);
-	assert.deepEqual(retainedSnapshot.tasks.map((task) => task.id), expectedTaskIds);
-	assert.deepEqual(new Set(retainedSnapshot.tasks.map((task) => task.status)), new Set(["pending", "cancelled"]));
+	assert.equal(retainedSnapshot.tasks.length, 10 + 20);
+	assert.deepEqual(retainedSnapshot.tasks.slice(0, 10).map((t) => t.id), earlyPendingTasks.map((t) => t.id));
+	assert.deepEqual(retainedSnapshot.tasks.slice(10).map((t) => t.id), cancelledHistory.slice(-20).reverse().map((t) => t.id));
 	const inspection = new DatabaseSync(databasePath, { readOnly: true });
 	try {
-		const storedTasks = inspection.prepare("SELECT id FROM tasks ORDER BY updatedAt DESC, createdAt DESC, rowid DESC").all();
-		assert.deepEqual(storedTasks.map((task) => task.id), expectedTaskIds);
-		const evictedIds = [firstTask.id, scheduledTask.id, ...retainedCreations.slice(0, 2).map((task) => task.id)];
-		for (const taskId of evictedIds) {
-			assert.equal(inspection.prepare("SELECT COUNT(*) AS total FROM events WHERE taskId = ?").get(taskId).total, 0);
-		}
+		assert.equal(inspection.prepare("SELECT COUNT(*) AS total FROM tasks WHERE status = 'pending'").get().total, 10);
 		assert.deepEqual(inspection.prepare("PRAGMA foreign_key_check").all(), []);
 	} finally {
 		inspection.close();
 	}
-	console.log("PASS: snapshot and SQLite keep the same twenty mixed-status records across accounts; older rows and events are removed");
+	console.log("PASS: active pending tasks never get evicted by later history; snapshot shows all active + 20 recent terminal tasks");
 
 	const pushedMessages = [];
 	const mockWeComServer = createHttpServer((req, res) => {

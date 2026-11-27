@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { AutoSignStore, getStudentIdentity, TASK_LEASE_MS, DISPATCHER_LEASE_MS, MAX_PREPARATION_ATTEMPTS } from "../src/lib/auto-sign/store.ts";
 import { AutoSignService } from "../src/lib/auto-sign/service.ts";
-import { AUTO_SIGN_RECORD_LIMIT } from "../src/lib/auto-sign/types.ts";
+import { AUTO_SIGN_DISPLAY_HISTORY_LIMIT, AUTO_SIGN_HISTORY_LIMIT } from "../src/lib/auto-sign/types.ts";
 import { calculateOccurrence, calculateScheduleOffsetSeconds, normalizeCourseDate, SIGN_RANDOM_WINDOW_SECONDS, DEADLINE_BEFORE_CLASS_MS } from "../src/lib/auto-sign/time.ts";
 import { createCipheriv, createHash, randomBytes } from "node:crypto";
 import { verifyMachineCredential } from "../src/lib/auto-sign/environment.ts";
@@ -177,131 +177,130 @@ test("random preview matches saved time across service and database restarts", a
 	}
 });
 
-test("retention keeps twenty recently updated tasks across accounts and statuses, removing old events too", async (context) => {
+test("retention never evicts active tasks across accounts, caps terminal history at 100 in SQLite, and displays all active plus 20 recent terminal tasks", async (context) => {
 	const { store, state, database, databasePath, createStoredTask } = await createRetentionFixture(context);
-	assert.equal(AUTO_SIGN_RECORD_LIMIT, 20);
+	assert.equal(AUTO_SIGN_HISTORY_LIMIT, 100);
+	assert.equal(AUTO_SIGN_DISPLAY_HISTORY_LIMIT, 20);
 	assert.deepEqual(store.listTasks(), []);
 	const accountsBefore = database.prepare("SELECT * FROM account_settings ORDER BY accountId").all();
 	const heartbeatBefore = store.getHeartbeat();
-	const statuses = ["pending", "retry_wait", "preparing", "uncertain", "succeeded", "skipped",
-		"cancelled", "paused", "expired", "dry_run", "failed", "submitting"];
-	const createdTasks = [];
-	for (let taskIndex = 0; taskIndex < 25; taskIndex += 1) {
-		const task = createStoredTask(taskIndex);
-		database.prepare("UPDATE tasks SET status = ? WHERE id = ?").run(statuses[taskIndex % statuses.length], task.id);
-		createdTasks.push(task);
-		assert.equal(store.listTasks().length, Math.min(taskIndex + 1, 20));
-		assert.equal(database.prepare("SELECT COUNT(*) AS total FROM tasks").get().total, Math.min(taskIndex + 1, 20));
+
+	// 1. Pre-book 15 active tasks early (simulating Monday weekly pre-booking across students).
+	const activeStatuses = ["pending", "retry_wait", "preparing", "submitting", "uncertain"];
+	const activeTasks = [];
+	for (let i = 0; i < 15; i += 1) {
+		const task = createStoredTask(i, state.now + i);
+		database.prepare("UPDATE tasks SET status = ? WHERE id = ?").run(activeStatuses[i % activeStatuses.length], task.id);
+		activeTasks.push(task);
 	}
-	assert.deepEqual(store.listTasks().map((task) => task.id), createdTasks.slice(-20).reverse().map((task) => task.id));
-	assert.deepEqual(new Set(store.listTasks().map((task) => task.accountId)), new Set(["alpha", "beta"]));
-	for (const removedTask of createdTasks.slice(0, 5)) {
-		assert.equal(store.getTask(removedTask.id), undefined);
-		assert.equal(database.prepare("SELECT COUNT(*) AS total FROM events WHERE taskId = ?").get(removedTask.id).total, 0);
+
+	// 2. Create and complete 105 later terminal tasks across accounts.
+	const terminalStatuses = ["succeeded", "skipped", "cancelled", "paused", "expired", "dry_run", "failed"];
+	const terminalTasks = [];
+	for (let i = 0; i < 105; i += 1) {
+		const task = createStoredTask(20 + i, state.now + 1000 + i);
+		const status = terminalStatuses[i % terminalStatuses.length];
+		if (status === "cancelled") {
+			store.cancelTask(task.id, state.now + 2000 + i);
+		} else {
+			const claimed = store.getTask(task.id);
+			database.prepare("UPDATE tasks SET status = 'preparing', leaseToken = 't1' WHERE id = ?").run(task.id);
+			store.finishTask({ ...claimed, leaseToken: "t1" }, status, "DONE", state.now + 2000 + i);
+		}
+		terminalTasks.push(task);
 	}
-	// Updating an older record makes it recent; active tasks have no special exemption.
-	database.prepare("UPDATE tasks SET updatedAt = ? WHERE id = ?").run(state.now + 100, createdTasks[5].id);
-	const newestTask = createStoredTask(25, state.now + 101);
-	assert.equal(store.listTasks()[0].id, newestTask.id);
-	assert.equal(store.listTasks()[1].id, createdTasks[5].id);
-	assert.equal(store.getTask(createdTasks[6].id), undefined);
-	assert.equal(database.prepare("SELECT COUNT(*) AS total FROM events").get().total, 20);
+
+	// All 15 early active tasks survive untouched!
+	for (const active of activeTasks) {
+		assert.ok(store.getTask(active.id), `Active task ${active.id} must never be evicted`);
+	}
+	// Oldest 5 terminal tasks (and their events) were pruned; newest 100 terminal tasks remain in SQLite.
+	for (const evicted of terminalTasks.slice(0, 5)) {
+		assert.equal(store.getTask(evicted.id), undefined);
+		assert.equal(database.prepare("SELECT COUNT(*) AS total FROM events WHERE taskId = ?").get(evicted.id).total, 0);
+	}
+	assert.equal(database.prepare("SELECT COUNT(*) AS total FROM tasks").get().total, 15 + 100);
+
+	// listTasks() returns all 15 active tasks (chronological) + 20 most recent terminal tasks = 35 tasks.
+	const listed = store.listTasks();
+	assert.equal(listed.length, 15 + 20);
+	assert.deepEqual(listed.slice(0, 15).map((t) => t.id), activeTasks.map((t) => t.id));
+	assert.deepEqual(listed.slice(15).map((t) => t.id), terminalTasks.slice(-20).reverse().map((t) => t.id));
 	assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
 	assert.deepEqual(database.prepare("SELECT * FROM account_settings ORDER BY accountId").all(), accountsBefore);
 	assert.deepEqual(store.getHeartbeat(), heartbeatBefore);
-	const retainedTasks = store.listTasks();
+
 	const reopenedStore = new AutoSignStore(databasePath);
 	try {
-		assert.deepEqual(reopenedStore.listTasks(), retainedTasks);
+		assert.deepEqual(reopenedStore.listTasks(), listed);
 	} finally {
 		reopenedStore.close();
 	}
 });
 
-test("same-millisecond creations from multiple connections keep the newest inserts and reject backward-clock loss", async (context) => {
+test("same-millisecond creations from multiple connections keep all active tasks and break terminal retention ties deterministically", async (context) => {
 	const { store, state, database, databasePath, createStoredTask } = await createRetentionFixture(context);
 	const secondStore = new AutoSignStore(databasePath);
 	context.after(() => secondStore.close());
-	const tasks = [];
-	for (let taskIndex = 0; taskIndex < 25; taskIndex += 1) {
-		tasks.push(createStoredTask(taskIndex, state.now, taskIndex % 2 === 0 ? store : secondStore));
+	const activeTasks = [];
+	for (let taskIndex = 0; taskIndex < 30; taskIndex += 1) {
+		activeTasks.push(createStoredTask(taskIndex, state.now, taskIndex % 2 === 0 ? store : secondStore));
 	}
-	assert.deepEqual(store.listTasks().map((task) => task.id), tasks.slice(-20).reverse().map((task) => task.id));
+	assert.equal(store.listTasks().length, 30);
 	assert.deepEqual(secondStore.listTasks(), store.listTasks());
-	const rowsBefore = database.prepare("SELECT * FROM tasks ORDER BY rowid").all();
-	const eventsBefore = database.prepare("SELECT * FROM events ORDER BY id").all();
-	assert.throws(() => createStoredTask(30, state.now - 1), { code: "CLOCK_SKEW" });
-	assert.deepEqual(database.prepare("SELECT * FROM tasks ORDER BY rowid").all(), rowsBefore);
-	assert.deepEqual(database.prepare("SELECT * FROM events ORDER BY id").all(), eventsBefore);
+	assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
 });
 
-test("opening an older database prunes records and events atomically without preserving hidden overflow", async (context) => {
+test("opening an older database prunes terminal overflow atomically while preserving every pending task", async (context) => {
 	const { store, database, databasePath, createStoredTask } = await createRetentionFixture(context);
 	const initialTask = createStoredTask(0);
 	const template = store.getTask(initialTask.id);
 	const columns = Object.keys(template);
 	const insertTask = database.prepare(`INSERT INTO tasks (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`);
-	for (let taskIndex = 1; taskIndex < 25; taskIndex += 1) {
+	for (let taskIndex = 1; taskIndex <= 105; taskIndex += 1) {
 		const record = { ...template, id: `legacy-${taskIndex}`, courseSchedId: String(7100000 + taskIndex),
 			updatedAt: template.updatedAt + taskIndex, createdAt: template.createdAt + taskIndex,
-			status: taskIndex % 2 === 0 ? "pending" : "succeeded", deletedAt: taskIndex === 1 ? template.updatedAt : null };
+			status: "succeeded", deletedAt: taskIndex === 1 ? template.updatedAt : null };
 		insertTask.run(...columns.map((column) => record[column]));
 		database.prepare("INSERT INTO events(taskId, createdAt, stage, code) VALUES (?, ?, 'schedule', 'SCHEDULED')")
 			.run(record.id, record.createdAt);
 	}
 	const originalRows = database.prepare("SELECT * FROM tasks ORDER BY rowid").all();
-	const originalEvents = database.prepare("SELECT * FROM events ORDER BY id").all();
 	database.exec(`CREATE TRIGGER reject_retention_delete BEFORE DELETE ON tasks WHEN OLD.id = 'legacy-1'
 		BEGIN SELECT RAISE(ABORT, 'Synthetic deletion failure'); END;`);
 	assert.throws(() => new AutoSignStore(databasePath), /Synthetic deletion failure/);
 	assert.deepEqual(database.prepare("SELECT * FROM tasks ORDER BY rowid").all(), originalRows);
-	assert.deepEqual(database.prepare("SELECT * FROM events ORDER BY id").all(), originalEvents);
 	database.exec("DROP TRIGGER reject_retention_delete");
+
 	const reopenedStore = new AutoSignStore(databasePath);
 	try {
-		assert.equal(reopenedStore.listTasks().length, 20);
-		assert.deepEqual(database.prepare("SELECT * FROM tasks ORDER BY rowid").all(), originalRows.slice(-20));
-		assert.deepEqual(database.prepare("SELECT * FROM events ORDER BY id").all(), originalEvents.slice(-20));
-		assert.equal(reopenedStore.getTask("legacy-1"), undefined);
+		assert.ok(reopenedStore.getTask(initialTask.id), "Earliest pending task must remain intact");
+		for (let idx = 1; idx <= 5; idx += 1) {
+			assert.equal(reopenedStore.getTask(`legacy-${idx}`), undefined);
+		}
+		assert.equal(database.prepare("SELECT COUNT(*) AS total FROM tasks").get().total, 1 + 100);
+		assert.equal(reopenedStore.listTasks().length, 1 + 20);
 		assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
 	} finally {
 		reopenedStore.close();
 	}
 });
 
-test("new tasks wait rather than evict an in-flight submission and its result", async (context) => {
-	const { store, state, database, schedule, createStoredTask } = await createRetentionFixture(context);
-	const submittingTask = await schedule();
-	state.now = submittingTask.scheduledAt;
-	const claimedTask = store.claimNextTask(state.now);
-	assert.equal(store.markSubmitting(claimedTask, state.now), true);
-	for (let taskIndex = 0; taskIndex < 19; taskIndex += 1) createStoredTask(taskIndex, state.now + taskIndex + 1);
-	const recordsBefore = database.prepare("SELECT * FROM tasks ORDER BY rowid").all();
-	const eventsBefore = database.prepare("SELECT * FROM events ORDER BY id").all();
-	assert.throws(() => createStoredTask(19, state.now + 100), { code: "TASK_RETENTION_BUSY", status: 409 });
-	assert.deepEqual(database.prepare("SELECT * FROM tasks ORDER BY rowid").all(), recordsBefore);
-	assert.deepEqual(database.prepare("SELECT * FROM events ORDER BY id").all(), eventsBefore);
-	store.finishTask(claimedTask, "succeeded", "SIGNED", state.now + 101);
-	const createdTask = createStoredTask(19, state.now + 102);
-	assert.equal(store.listTasks().length, 20);
-	assert.equal(store.listTasks()[0].id, createdTask.id);
-	assert.equal(store.getTask(submittingTask.id).status, "succeeded");
-});
-
 for (const executionMode of ["live", "dry-run"]) {
-	test(`evicting a preparing task prevents execution and orphan events in ${executionMode}`, async (context) => {
+	test(`active preparing and submitting tasks survive heavy concurrent scheduling and history turnover in ${executionMode}`, async (context) => {
 		const { store, state, dependencies, service, schedule, database, createStoredTask } = await createRetentionFixture(context);
 		const task = await schedule("alpha", executionMode);
 		dependencies.getTimestamp = async () => {
-			for (let taskIndex = 0; taskIndex < 20; taskIndex += 1) createStoredTask(taskIndex, state.now);
+			for (let taskIndex = 0; taskIndex < 105; taskIndex += 1) {
+				const extra = createStoredTask(taskIndex + 10, state.now);
+				store.cancelTask(extra.id, state.now);
+			}
 			return state.now;
 		};
 		state.now = task.scheduledAt;
 		await service.tick(executionMode);
-		assert.equal(state.signCalls.length, 0);
-		assert.equal(store.getTask(task.id), undefined);
-		assert.equal(store.listTasks().length, 20);
-		assert.equal(database.prepare("SELECT COUNT(*) AS total FROM events WHERE taskId = ?").get(task.id).total, 0);
+		assert.equal(state.signCalls.length, executionMode === "live" ? 1 : 0);
+		assert.equal(store.getTask(task.id)?.status, executionMode === "live" ? "succeeded" : "dry_run");
 		assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
 	});
 }

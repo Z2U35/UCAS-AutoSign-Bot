@@ -1,6 +1,8 @@
 export type AutoSignMode = "dry-run" | "live";
 
-export const AUTO_SIGN_RECORD_LIMIT = 20;
+export const AUTO_SIGN_HISTORY_LIMIT = 100;
+export const AUTO_SIGN_DISPLAY_HISTORY_LIMIT = 20;
+export const AUTO_SIGN_RECORD_LIMIT = AUTO_SIGN_DISPLAY_HISTORY_LIMIT;
 
 export type TaskStatus =
 	| "pending" | "preparing" | "submitting" | "retry_wait"

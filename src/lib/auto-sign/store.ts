@@ -3,10 +3,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import type { StudentAccount } from "../private-config.ts";
-import { AUTO_SIGN_RECORD_LIMIT, AutoSignError, canDeleteAutoSignTask, type AutoSignMode, type AutoSignPreview, type AutoSignTask, type SchedulerHeartbeat, type TaskEvent, type TaskStatus } from "./types.ts";
+import { AUTO_SIGN_DISPLAY_HISTORY_LIMIT, AUTO_SIGN_HISTORY_LIMIT, AutoSignError, canDeleteAutoSignTask, type AutoSignMode, type AutoSignPreview, type AutoSignTask, type SchedulerHeartbeat, type TaskEvent, type TaskStatus } from "./types.ts";
 
 const CANCELLABLE_STATES = "'pending', 'retry_wait', 'preparing'";
-const DEDUPLICATED_STATES = `${CANCELLABLE_STATES}, 'submitting', 'uncertain', 'succeeded', 'skipped'`;
+const ACTIVE_STATES = `${CANCELLABLE_STATES}, 'submitting', 'uncertain'`;
+const TERMINAL_STATES = "'succeeded', 'skipped', 'cancelled', 'paused', 'expired', 'dry_run', 'failed'";
+const DEDUPLICATED_STATES = `${ACTIVE_STATES}, 'succeeded', 'skipped'`;
 const RECENT_TASK_ORDER = "updatedAt DESC, createdAt DESC, rowid DESC";
 export const TASK_LEASE_MS = 60_000;
 export const DISPATCHER_LEASE_MS = 60_000;
@@ -100,17 +102,12 @@ export class AutoSignStore {
 			.run(taskId, now, stage, code);
 	}
 
-	private pruneTaskRecords(newTaskId?: string): void {
-		const overflowTasks = this.database.prepare(`SELECT id, status FROM tasks
+	private pruneTaskRecords(excludeTaskId = ""): void {
+		const overflowTasks = this.database.prepare(`SELECT id FROM tasks
+			WHERE status IN (${TERMINAL_STATES}) AND id != ?
 			ORDER BY ${RECENT_TASK_ORDER} LIMIT -1 OFFSET ?`)
-			.all(AUTO_SIGN_RECORD_LIMIT) as Pick<TaskRecord, "id" | "status">[];
-		// Roll back new work rather than discard evidence of an in-flight submission.
-		if (overflowTasks.some((task) => task.status === "submitting")) {
-			throw new AutoSignError("TASK_RETENTION_BUSY", 409);
-		}
-		if (overflowTasks.some((task) => task.id === newTaskId)) {
-			throw new AutoSignError("CLOCK_SKEW", 409);
-		}
+			.all(excludeTaskId, excludeTaskId ? AUTO_SIGN_HISTORY_LIMIT - 1 : AUTO_SIGN_HISTORY_LIMIT) as Pick<TaskRecord, "id">[];
+		if (overflowTasks.length === 0) return;
 		const deleteEvents = this.database.prepare("DELETE FROM events WHERE taskId = ?");
 		const deleteTask = this.database.prepare("DELETE FROM tasks WHERE id = ?");
 		for (const task of overflowTasks) {
@@ -125,6 +122,7 @@ export class AutoSignStore {
 		this.database.prepare(`UPDATE tasks SET status = ?, resultCode = ?, updatedAt = ?, leaseToken = NULL,
 			leaseUntil = NULL WHERE accountId = ? AND status IN (${CANCELLABLE_STATES})`).run(status, code, now, accountId);
 		for (const task of tasks) this.addEvent(task.id, now, "authorization", code);
+		if (tasks.length > 0) this.pruneTaskRecords();
 	}
 
 	synchronizeAccounts(accounts: StudentAccount[], now: number): void {
@@ -185,7 +183,7 @@ export class AutoSignStore {
 				preview.courseName, preview.classBeginAt, preview.classEndAt, preview.scheduledAt, preview.deadlineAt, preview.scheduledAt, now, now, mode,
 			);
 			this.addEvent(taskId, now, "schedule", "SCHEDULED");
-			this.pruneTaskRecords(taskId);
+			this.pruneTaskRecords();
 			return this.toPublicTask(this.getTask(taskId)!);
 		});
 	}
@@ -215,10 +213,15 @@ export class AutoSignStore {
 	}
 
 	listTasks(): AutoSignTask[] {
-		const tasks = this.database.prepare(`SELECT * FROM tasks WHERE deletedAt IS NULL
+		const activeTasks = this.database.prepare(`SELECT * FROM tasks
+			WHERE deletedAt IS NULL AND status IN (${ACTIVE_STATES})
+			ORDER BY scheduledAt ASC, createdAt ASC, rowid ASC`)
+			.all() as TaskRecord[];
+		const historyTasks = this.database.prepare(`SELECT * FROM tasks
+			WHERE deletedAt IS NULL AND status IN (${TERMINAL_STATES})
 			ORDER BY ${RECENT_TASK_ORDER} LIMIT ?`)
-			.all(AUTO_SIGN_RECORD_LIMIT) as TaskRecord[];
-		return tasks.map((task) => this.toPublicTask(task));
+			.all(AUTO_SIGN_DISPLAY_HISTORY_LIMIT) as TaskRecord[];
+		return [...activeTasks, ...historyTasks].map((task) => this.toPublicTask(task));
 	}
 
 	deleteTask(taskId: string, now: number): void {
@@ -242,6 +245,7 @@ export class AutoSignStore {
 			this.database.prepare("UPDATE tasks SET status = 'cancelled', resultCode = 'CANCELLED', leaseToken = NULL, leaseUntil = NULL, updatedAt = ? WHERE id = ?")
 				.run(now, taskId);
 			this.addEvent(taskId, now, "cancel", "CANCELLED");
+			this.pruneTaskRecords(taskId);
 		});
 	}
 
@@ -291,6 +295,7 @@ export class AutoSignStore {
 				this.addEvent(task.id, now, "deadline", "DEADLINE_PASSED");
 				terminalTaskIds.push(task.id);
 			}
+			if (terminalTaskIds.length > 0) this.pruneTaskRecords();
 			return terminalTaskIds;
 		});
 	}
@@ -339,7 +344,10 @@ export class AutoSignStore {
 			const update = this.database.prepare(`UPDATE tasks SET status = ?, resultCode = ?, updatedAt = ?, nextAttemptAt = ?,
 				leaseToken = NULL, leaseUntil = NULL WHERE id = ? AND leaseToken = ? AND status IN ('preparing', 'submitting', 'uncertain')`)
 				.run(status, code, now, nextAttemptAt, task.id, task.leaseToken);
-			if (update.changes) this.addEvent(task.id, now, status, code);
+			if (update.changes) {
+				this.addEvent(task.id, now, status, code);
+				if (canDeleteAutoSignTask({ status })) this.pruneTaskRecords(task.id);
+			}
 		});
 	}
 
