@@ -1,34 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
-
-const LOGIN_URL = "https://iclass.ucas.edu.cn:8181/app/user/login.action";
-const SCHEDULE_URL = "https://iclass.ucas.edu.cn:8181/app/course/get_stu_course_sched.action";
-
-const LOGIN_UA = "student_5.0.1.2_android_12_20__110000";
-const API_UA = "student_5.0.1.2_android_12_20_100000000000000_110000";
-
-type LoginResponse = {
-	STATUS?: string;
-	result?: {
-		id?: string;
-		sessionId?: string;
-	};
-};
-
-type CourseItem = {
-	id?: string;
-	uuid?: string;
-	courseName?: string;
-	teacherName?: string;
-	weekDay?: string;
-	classBeginTime?: string;
-	classEndTime?: string;
-	signStatus?: string;
-};
-
-type ScheduleResponse = {
-	STATUS?: string;
-	result?: CourseItem[];
-};
+import { requireAccess } from "@/lib/access";
+import { IclassError, loginIclass, queryIclassSchedule } from "@/lib/iclass";
+import { resolveCredentials } from "@/lib/private-config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -39,12 +12,11 @@ const RESPONSE_HEADERS = {
 	"Referrer-Policy": "no-referrer",
 	"X-Frame-Options": "DENY"
 };
-const REQUEST_TIMEOUT_MS = 10000;
 
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-const RATE_LIMIT_WINDOW_MAX = toPositiveInt(process.env.RATE_LIMIT_5M_MAX, 10);
-const RATE_LIMIT_DAILY_MAX = toPositiveInt(process.env.RATE_LIMIT_DAILY_MAX, 20);
+const RATE_LIMIT_WINDOW_MAX = toPositiveInt(process.env.RATE_LIMIT_5M_MAX, 100);
+const RATE_LIMIT_DAILY_MAX = toPositiveInt(process.env.RATE_LIMIT_DAILY_MAX, 1000);
 const RATE_LIMIT_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 const MAX_USERNAME_LENGTH = 40;
 const MAX_PASSWORD_LENGTH = 80;
@@ -57,19 +29,6 @@ type RateLimitState = {
 
 const ipRateLimitStore = new Map<string, RateLimitState>();
 let lastRateLimitSweepAt = 0;
-
-class ApiError extends Error {
-	status: number;
-	code: string;
-	stage: "login" | "schedule" | "request";
-
-	constructor(status: number, code: string, message: string, stage: "login" | "schedule" | "request") {
-		super(message);
-		this.status = status;
-		this.code = code;
-		this.stage = stage;
-	}
-}
 
 function normalizeDateToYyyyMMdd(input: string): string | null {
 	const compact = input.replace(/-/g, "").trim();
@@ -196,35 +155,9 @@ function isCredentialInputInvalid(username: string, password: string): boolean {
 	return false;
 }
 
-function buildLoginBody(username: string, password: string): string {
-	const verificationUrlTemplate =
-		"http://iclass.ucas.edu.cn:88/ve/webservices/mobileCheck.shtml?method=mobileLogin&username=${0}&password=${1}&lx=${2}";
-
-	const body = new URLSearchParams({
-		phone: username,
-		password,
-		verificationType: "1",
-		verificationUrl: verificationUrlTemplate,
-		userLevel: "1"
-	});
-
-	return body.toString();
-}
-
-function sanitizeCourse(item: CourseItem) {
-	return {
-		id: item.id ?? "",
-		uuid: item.uuid ?? "",
-		courseName: item.courseName ?? "",
-		teacherName: item.teacherName ?? "",
-		weekDay: item.weekDay ?? "",
-		classBeginTime: item.classBeginTime ?? "",
-		classEndTime: item.classEndTime ?? "",
-		signStatus: item.signStatus ?? ""
-	};
-}
-
 export async function POST(req: NextRequest) {
+	const accessError = await requireAccess(req);
+	if (accessError) return accessError;
 	const startedAt = Date.now();
 	const requestId = crypto.randomUUID();
 	let stage: "login" | "schedule" | "request" = "request";
@@ -261,12 +194,13 @@ export async function POST(req: NextRequest) {
 		}
 
 		const bodyObject = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
-		const username = String(bodyObject.username ?? "").trim();
-		const password = String(bodyObject.password ?? "");
+		const credentials = await resolveCredentials(bodyObject);
+		if (!credentials) return jsonWithHeaders({ message: "快捷账号不存在，请刷新页面" }, { status: 400 });
+		const { username, password } = credentials;
 		const dateInput = String(bodyObject.date ?? "").trim();
 
 		if (isCredentialInputInvalid(username, password)) {
-			return jsonWithHeaders({ message: "学号或密码格式错误" }, { status: 400 });
+			return jsonWithHeaders({ message: "请输入15位数字学号" }, { status: 400 });
 		}
 
 		const date = normalizeDateToYyyyMMdd(dateInput);
@@ -275,98 +209,10 @@ export async function POST(req: NextRequest) {
 		}
 
 		stage = "login";
-		const loginAbortController = new AbortController();
-		const loginTimeout = setTimeout(() => loginAbortController.abort(), REQUEST_TIMEOUT_MS);
-
-		let loginData: LoginResponse;
-		try {
-			const loginRes = await fetch(LOGIN_URL, {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/x-www-form-urlencoded",
-					"User-Agent": LOGIN_UA
-				},
-				body: buildLoginBody(username, password),
-				cache: "no-store",
-				signal: loginAbortController.signal
-			});
-
-			if (!loginRes.ok) {
-				throw new ApiError(502, "UPSTREAM_LOGIN_HTTP", `登录接口HTTP异常: ${loginRes.status}`, "login");
-			}
-
-			try {
-				loginData = (await loginRes.json()) as LoginResponse;
-			} catch {
-				throw new ApiError(502, "UPSTREAM_LOGIN_BAD_JSON", "登录接口返回非JSON", "login");
-			}
-		} catch (error) {
-			if (error instanceof ApiError) {
-				throw error;
-			}
-			if (error instanceof Error && error.name === "AbortError") {
-				throw new ApiError(504, "UPSTREAM_LOGIN_TIMEOUT", "登录接口请求超时", "login");
-			}
-			throw new ApiError(502, "UPSTREAM_LOGIN_NETWORK", "登录接口网络异常", "login");
-		} finally {
-			clearTimeout(loginTimeout);
-		}
-
-		const sessionId = loginData?.result?.sessionId;
-		const userId = loginData?.result?.id;
-
-		if (loginData?.STATUS !== "0" || !sessionId || !userId) {
-			return jsonWithHeaders({ message: "登录失败，请检查学号密码是否正确" }, { status: 401 });
-		}
+		const session = await loginIclass(username, password);
 
 		stage = "schedule";
-		const scheduleAbortController = new AbortController();
-		const scheduleTimeout = setTimeout(() => scheduleAbortController.abort(), REQUEST_TIMEOUT_MS);
-
-		let scheduleData: ScheduleResponse;
-		try {
-			const scheduleUrl = `${SCHEDULE_URL}?id=${encodeURIComponent(userId)}&dateStr=${encodeURIComponent(date)}`;
-			const scheduleRes = await fetch(scheduleUrl, {
-				method: "GET",
-				headers: {
-					sessionId,
-					"User-Agent": API_UA
-				},
-				cache: "no-store",
-				signal: scheduleAbortController.signal
-			});
-
-			if (!scheduleRes.ok) {
-				throw new ApiError(
-					502,
-					"UPSTREAM_SCHEDULE_HTTP",
-					`课表接口HTTP异常: ${scheduleRes.status}`,
-					"schedule"
-				);
-			}
-
-			try {
-				scheduleData = (await scheduleRes.json()) as ScheduleResponse;
-			} catch {
-				throw new ApiError(502, "UPSTREAM_SCHEDULE_BAD_JSON", "课表接口返回非JSON", "schedule");
-			}
-		} catch (error) {
-			if (error instanceof ApiError) {
-				throw error;
-			}
-			if (error instanceof Error && error.name === "AbortError") {
-				throw new ApiError(504, "UPSTREAM_SCHEDULE_TIMEOUT", "课表接口请求超时", "schedule");
-			}
-			throw new ApiError(502, "UPSTREAM_SCHEDULE_NETWORK", "课表接口网络异常", "schedule");
-		} finally {
-			clearTimeout(scheduleTimeout);
-		}
-
-		if (scheduleData?.STATUS !== "0") {
-			return jsonWithHeaders({ message: "课表查询失败，或当天无课程" }, { status: 502 });
-		}
-
-		const courses = (scheduleData.result ?? []).map(sanitizeCourse);
+		const courses = await queryIclassSchedule(session, date);
 
 		return jsonWithHeaders(
 			{
@@ -377,20 +223,24 @@ export async function POST(req: NextRequest) {
 			{ status: 200 }
 		);
 	} catch (error) {
+		const isIclassError = error instanceof IclassError;
+		if (isIclassError && (error.code === "UPSTREAM_LOGIN_REJECTED" || error.code === "UPSTREAM_SCHEDULE_REJECTED")) {
+			return jsonWithHeaders({ message: error.message }, { status: error.status });
+		}
+
 		const durationMs = Date.now() - startedAt;
-		const isApiError = error instanceof ApiError;
 		const logPayload = {
 			requestId,
 			stage,
 			durationMs,
-			errorName: error instanceof Error ? error.name : "UnknownError",
-			errorMessage: error instanceof Error ? error.message : "Unknown error",
-			code: isApiError ? error.code : "UNEXPECTED_ERROR"
+			errorName: isIclassError ? "IclassError" : "UnknownError",
+			errorMessage: isIclassError ? error.message : "Unexpected request failure",
+			code: isIclassError ? error.code : "UNEXPECTED_ERROR"
 		};
 
 		console.error("[course-uuid/query]", JSON.stringify(logPayload));
 
-		if (isApiError) {
+		if (isIclassError) {
 			return jsonWithHeaders({ message: error.message, code: error.code }, { status: error.status });
 		}
 

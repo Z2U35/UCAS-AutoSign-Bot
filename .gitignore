@@ -43,3 +43,15 @@ next-env.d.ts
 /httpcanary
 
 /.claude
+
+# Private deployment credentials and generated access password
+/config/*
+!/config/example.json
+
+# Scheduler state and machine credentials must never be committed
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.machine-key
+auto-sign.key

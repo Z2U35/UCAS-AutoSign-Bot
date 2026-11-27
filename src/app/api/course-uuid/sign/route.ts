@@ -1,10 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
-
-const LOGIN_URL = "https://iclass.ucas.edu.cn:8181/app/user/login.action";
-const SIGN_URL = "https://iclass.ucas.edu.cn:8181/app/course/stu_scan_sign.action";
-
-const LOGIN_UA = "student_5.0.1.2_android_12_20__110000";
-const API_UA = "student_5.0.1.2_android_12_20_100000000000000_110000";
+import { requireAccess } from "@/lib/access";
+import { IclassError, loginIclass, submitIclassSign } from "@/lib/iclass";
+import { resolveCredentials } from "@/lib/private-config";
 
 const RESPONSE_HEADERS = {
 	"Cache-Control": "no-store",
@@ -12,12 +9,11 @@ const RESPONSE_HEADERS = {
 	"Referrer-Policy": "no-referrer",
 	"X-Frame-Options": "DENY",
 };
-const REQUEST_TIMEOUT_MS = 10000;
 
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 const RATE_LIMIT_WINDOW_MAX = toPositiveInt(process.env.RATE_LIMIT_5M_MAX, 100);
-const RATE_LIMIT_DAILY_MAX = toPositiveInt(process.env.RATE_LIMIT_DAILY_MAX, 20);
+const RATE_LIMIT_DAILY_MAX = toPositiveInt(process.env.RATE_LIMIT_DAILY_MAX, 1000);
 const RATE_LIMIT_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 const MAX_USERNAME_LENGTH = 40;
 const MAX_PASSWORD_LENGTH = 80;
@@ -28,42 +24,8 @@ type RateLimitState = {
 	dailyResetAt: number;
 };
 
-type LoginResponse = {
-	STATUS?: string;
-	result?: {
-		id?: string;
-		sessionId?: string;
-	};
-};
-
-type UpstreamSignResponse = {
-	STATUS?: string;
-	message?: string;
-	msg?: string;
-	ERRCODE?: string;
-	ERRMSG?: string;
-	result?: {
-		stuSignId?: string;
-		stuSignStatus?: string;
-		msg?: string;
-	};
-};
-
 const ipRateLimitStore = new Map<string, RateLimitState>();
 let lastRateLimitSweepAt = 0;
-
-class ApiError extends Error {
-	status: number;
-	code: string;
-	stage: "login" | "sign" | "request";
-
-	constructor(status: number, code: string, message: string, stage: "login" | "sign" | "request") {
-		super(message);
-		this.status = status;
-		this.code = code;
-		this.stage = stage;
-	}
-}
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -193,22 +155,9 @@ function normalizeCourseSchedId(raw: string): string | null {
 	return compact;
 }
 
-function buildLoginBody(username: string, password: string): string {
-	const verificationUrlTemplate =
-		"http://iclass.ucas.edu.cn:88/ve/webservices/mobileCheck.shtml?method=mobileLogin&username=${0}&password=${1}&lx=${2}";
-
-	const body = new URLSearchParams({
-		phone: username,
-		password,
-		verificationType: "1",
-		verificationUrl: verificationUrlTemplate,
-		userLevel: "1",
-	});
-
-	return body.toString();
-}
-
 export async function POST(req: NextRequest) {
+	const accessError = await requireAccess(req);
+	if (accessError) return accessError;
 	const startedAt = Date.now();
 	const requestId = crypto.randomUUID();
 	let stage: "login" | "sign" | "request" = "request";
@@ -245,8 +194,9 @@ export async function POST(req: NextRequest) {
 		}
 
 		const bodyObject = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
-		const username = String(bodyObject.username ?? "").trim();
-		const password = String(bodyObject.password ?? "");
+		const credentials = await resolveCredentials(bodyObject);
+		if (!credentials) return jsonWithHeaders({ message: "快捷账号不存在，请刷新页面" }, { status: 400 });
+		const { username, password } = credentials;
 		const courseSchedIdRaw = String(bodyObject.courseSchedId ?? bodyObject.timeTableId ?? "");
 		const courseSchedId = normalizeCourseSchedId(courseSchedIdRaw);
 		const clientTimestamp =
@@ -255,7 +205,7 @@ export async function POST(req: NextRequest) {
 				: Date.now();
 
 		if (isCredentialInputInvalid(username, password)) {
-			return jsonWithHeaders({ message: "学号或密码格式错误" }, { status: 400 });
+			return jsonWithHeaders({ message: "请输入15位数字学号" }, { status: 400 });
 		}
 
 		if (!courseSchedId) {
@@ -263,151 +213,31 @@ export async function POST(req: NextRequest) {
 		}
 
 		stage = "login";
-		const loginAbortController = new AbortController();
-		const loginTimeout = setTimeout(() => loginAbortController.abort(), REQUEST_TIMEOUT_MS);
-
-		let loginData: LoginResponse;
-		try {
-			const loginRes = await fetch(LOGIN_URL, {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/x-www-form-urlencoded",
-					"User-Agent": LOGIN_UA,
-				},
-				body: buildLoginBody(username, password),
-				cache: "no-store",
-				signal: loginAbortController.signal,
-			});
-
-			if (!loginRes.ok) {
-				throw new ApiError(502, "UPSTREAM_LOGIN_HTTP", `登录接口HTTP异常: ${loginRes.status}`, "login");
-			}
-
-			try {
-				loginData = (await loginRes.json()) as LoginResponse;
-			} catch {
-				throw new ApiError(502, "UPSTREAM_LOGIN_BAD_JSON", "登录接口返回非JSON", "login");
-			}
-		} catch (error) {
-			if (error instanceof ApiError) {
-				throw error;
-			}
-			if (error instanceof Error && error.name === "AbortError") {
-				throw new ApiError(504, "UPSTREAM_LOGIN_TIMEOUT", "登录接口请求超时", "login");
-			}
-			throw new ApiError(502, "UPSTREAM_LOGIN_NETWORK", "登录接口网络异常", "login");
-		} finally {
-			clearTimeout(loginTimeout);
-		}
-
-		const sessionId = loginData?.result?.sessionId;
-		const userId = loginData?.result?.id;
-
-		if (loginData?.STATUS !== "0" || !sessionId || !userId) {
-			return jsonWithHeaders({ message: "登录失败，请检查学号密码是否正确" }, { status: 401 });
-		}
+		const session = await loginIclass(username, password);
 
 		stage = "sign";
-		const signAbortController = new AbortController();
-		const signTimeout = setTimeout(() => signAbortController.abort(), REQUEST_TIMEOUT_MS);
+		const { status, ...responseBody } = await submitIclassSign(session, courseSchedId, clientTimestamp);
 
-		let signData: UpstreamSignResponse;
-		try {
-			const upstreamUrl = `${SIGN_URL}?courseSchedId=${encodeURIComponent(courseSchedId)}&timestamp=${clientTimestamp}&id=${encodeURIComponent(userId)}`;
-
-			const signRes = await fetch(upstreamUrl, {
-				method: "GET",
-				headers: {
-					sessionId,
-					"User-Agent": API_UA,
-				},
-				cache: "no-store",
-				signal: signAbortController.signal,
-			});
-
-			if (!signRes.ok) {
-				throw new ApiError(502, "UPSTREAM_SIGN_HTTP", `签到接口HTTP异常: ${signRes.status}`, "sign");
-			}
-
-			try {
-				signData = (await signRes.json()) as UpstreamSignResponse;
-			} catch {
-				throw new ApiError(502, "UPSTREAM_SIGN_BAD_JSON", "签到接口返回非JSON", "sign");
-			}
-		} catch (error) {
-			if (error instanceof ApiError) {
-				throw error;
-			}
-			if (error instanceof Error && error.name === "AbortError") {
-				throw new ApiError(504, "UPSTREAM_SIGN_TIMEOUT", "签到接口请求超时", "sign");
-			}
-			throw new ApiError(502, "UPSTREAM_SIGN_NETWORK", "签到接口网络异常", "sign");
-		} finally {
-			clearTimeout(signTimeout);
-		}
-
-		const upstreamStatus = signData?.STATUS ?? "";
-		const stuSignId = signData?.result?.stuSignId ?? "";
-		const stuSignStatus = signData?.result?.stuSignStatus ?? "";
-		const upstreamMessage = signData?.result?.msg ?? signData?.ERRMSG ?? signData?.msg ?? signData?.message ?? "";
-
-		if (upstreamStatus === "0" && stuSignStatus === "1") {
-			return jsonWithHeaders(
-				{
-					success: true,
-					message: "签到成功",
-					upstreamStatus,
-					result: {
-						stuSignId,
-						stuSignStatus,
-					},
-				},
-				{ status: 200 },
-			);
-		}
-
-		if (upstreamStatus === "0" && stuSignStatus && stuSignStatus !== "1") {
-			return jsonWithHeaders(
-				{
-					success: false,
-					message: "签到请求已提交，但状态未完成",
-					upstreamStatus,
-					result: {
-						stuSignId,
-						stuSignStatus,
-					},
-				},
-				{ status: 409 },
-			);
-		}
-
-		return jsonWithHeaders(
-			{
-				success: false,
-				message: upstreamMessage || "签到失败，请稍后重试",
-				upstreamStatus,
-				result: {
-					stuSignId,
-					stuSignStatus,
-				},
-			},
-			{ status: 400 },
-		);
+		return jsonWithHeaders(responseBody, { status });
 	} catch (error) {
+		const isIclassError = error instanceof IclassError;
+		if (isIclassError && error.code === "UPSTREAM_LOGIN_REJECTED") {
+			return jsonWithHeaders({ message: error.message }, { status: error.status });
+		}
+
 		const durationMs = Date.now() - startedAt;
-		const isApiError = error instanceof ApiError;
 		const logPayload = {
 			requestId,
 			stage,
 			durationMs,
-			errorName: error instanceof Error ? error.name : "UnknownError",
-			errorMessage: error instanceof Error ? error.message : "Unknown error",
-			code: isApiError ? error.code : "UNEXPECTED_ERROR",
+			errorName: isIclassError ? "IclassError" : "UnknownError",
+			errorMessage: isIclassError ? error.message : "Unexpected request failure",
+			code: isIclassError ? error.code : "UNEXPECTED_ERROR",
 		};
 
 		console.error("[course-uuid/sign]", JSON.stringify(logPayload));
 
-		if (isApiError) {
+		if (isIclassError) {
 			return jsonWithHeaders({ message: error.message, code: error.code }, { status: error.status });
 		}
 

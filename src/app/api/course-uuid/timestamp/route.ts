@@ -1,10 +1,9 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
+import { requireAccess } from "@/lib/access";
+import { getIclassTimestamp, IclassError } from "@/lib/iclass";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-const TIMESTAMP_URL = "https://iclass.ucas.edu.cn:8181/app/common/get_timestamp.do";
-const API_UA = "student_5.0.1.2_android_12_20_100000000000000_110000";
 
 const RESPONSE_HEADERS = {
 	"Cache-Control": "no-store",
@@ -13,39 +12,17 @@ const RESPONSE_HEADERS = {
 	"X-Frame-Options": "DENY",
 };
 
-const REQUEST_TIMEOUT_MS = 6000;
-
-export async function GET() {
+export async function GET(request: NextRequest) {
+	const accessError = await requireAccess(request);
+	if (accessError) return accessError;
 	try {
-		const controller = new AbortController();
-		const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-		// 添加随机 id 参数以防止中间节点缓存
-		const url = `${TIMESTAMP_URL}?id=${Math.floor(Math.random() * 1000000)}`;
-
-		const res = await fetch(url, {
-			method: "POST",
-			headers: {
-				"User-Agent": API_UA,
-				Connection: "Keep-Alive",
-			},
-			signal: controller.signal,
-		});
-
-		clearTimeout(timeoutId);
-
-		const data = await res.json();
-		if (data.STATUS === "0" && typeof data.timestamp === "number") {
-			return NextResponse.json({ success: true, timestamp: data.timestamp }, { headers: RESPONSE_HEADERS });
-		}
+		const timestamp = await getIclassTimestamp();
+		return NextResponse.json({ success: true, timestamp }, { headers: RESPONSE_HEADERS });
+	} catch (error) {
+		const isInvalidResponse = error instanceof IclassError && error.code === "UPSTREAM_TIMESTAMP_INVALID_RESPONSE";
 		return NextResponse.json(
-			{ success: false, message: "Invalid server response" },
-			{ status: 502, headers: RESPONSE_HEADERS },
-		);
-	} catch (e) {
-		return NextResponse.json(
-			{ success: false, message: "Failed to fetch server timestamp" },
-			{ status: 504, headers: RESPONSE_HEADERS },
+			{ success: false, message: isInvalidResponse ? "Invalid server response" : "Failed to fetch server timestamp" },
+			{ status: isInvalidResponse ? 502 : 504, headers: RESPONSE_HEADERS },
 		);
 	}
 }

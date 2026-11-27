@@ -1,74 +1,88 @@
 import type { Metadata, Viewport } from "next";
-import { IBM_Plex_Mono, Noto_Sans_SC, Noto_Serif_SC } from "next/font/google";
-import Script from "next/script";
+import { Suspense } from "react";
+import {
+	Inter,
+	JetBrains_Mono,
+	Lora,
+	Noto_Sans_SC,
+	Noto_Serif_SC,
+	Playfair_Display,
+} from "next/font/google";
+import { cookies } from "next/headers";
+import { isSessionValid, SESSION_COOKIE } from "@/lib/access";
+import AccessGate from "./access-gate";
 import "./globals.css";
+
+const playfairDisplay = Playfair_Display({
+	variable: "--font-playfair",
+	subsets: ["latin"],
+	display: "swap",
+});
+
+const lora = Lora({
+	variable: "--font-lora",
+	subsets: ["latin"],
+	display: "swap",
+});
+
+const inter = Inter({
+	variable: "--font-inter",
+	subsets: ["latin"],
+	display: "swap",
+});
+
+const jetBrainsMono = JetBrains_Mono({
+	variable: "--font-jetbrains",
+	subsets: ["latin"],
+	display: "swap",
+});
 
 const notoSans = Noto_Sans_SC({
 	variable: "--font-noto-sans",
 	subsets: ["latin"],
-	weight: ["400", "500", "700"],
+	display: "swap",
 });
 
 const notoSerif = Noto_Serif_SC({
 	variable: "--font-noto-serif",
 	subsets: ["latin"],
-	weight: ["400", "600", "700"],
-});
-
-const ibmPlexMono = IBM_Plex_Mono({
-	variable: "--font-ibm-mono",
-	subsets: ["latin"],
-	weight: ["400", "500"],
+	display: "swap",
 });
 
 export const metadata: Metadata = {
-	title: "UCAS Course Sign in",
-	description: "输入学号与密码，查询课程并生成实时刷新签到码（每5秒刷新，下载码10秒有效）",
+	title: "CookBook 日常食记 | 把日子过得有滋有味",
+	description: "发现日常烹饪的美味灵感，收藏喜欢的家常菜、甜点与暖心汤品。从简单食材开始，享受下厨的每一分钟。",
 	icons: {
-		icon: "/ucas.svg",
-		shortcut: "/ucas.svg",
-		apple: "/ucas.svg",
+		icon: "/cookbook.svg",
+		shortcut: "/cookbook.svg",
+		apple: "/cookbook.svg",
 	},
 };
 
 export const viewport: Viewport = {
-	themeColor: [
-		{ media: "(prefers-color-scheme: light)", color: "#f1f5fb" },
-		{ media: "(prefers-color-scheme: dark)", color: "#141f31" },
-	],
+	themeColor: "#F9F9F7",
+	colorScheme: "light",
 };
 
-const themeInitScript = `
-(function () {
-	try {
-		var saved = localStorage.getItem('ucas-theme-mode');
-		var mode = saved === 'light' || saved === 'dark' || saved === 'system' ? saved : 'system';
-		var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-		var resolved = mode === 'system' ? (prefersDark ? 'dark' : 'light') : mode;
-		document.documentElement.setAttribute('data-theme', resolved);
-	} catch (e) {
-		var fallbackDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-		document.documentElement.setAttribute('data-theme', fallbackDark ? 'dark' : 'light');
-	}
-})();
-`;
-
-export default function RootLayout({
+export default async function RootLayout({
 	children,
 }: Readonly<{
 	children: React.ReactNode;
 }>) {
+	let unlocked = false;
+	try {
+		unlocked = await isSessionValid((await cookies()).get(SESSION_COOKIE)?.value);
+	} catch {
+		// Configuration errors must never turn off access protection.
+	}
 	return (
 		<html
 			lang="zh-CN"
-			suppressHydrationWarning
-			className={`${notoSans.variable} ${notoSerif.variable} ${ibmPlexMono.variable} h-full antialiased`}
+			data-theme="light"
+			className={`${playfairDisplay.variable} ${lora.variable} ${inter.variable} ${jetBrainsMono.variable} ${notoSans.variable} ${notoSerif.variable} h-full antialiased`}
 		>
 			<body className="min-h-full flex flex-col">
-				<Script id="theme-init" strategy="beforeInteractive">
-					{themeInitScript}
-				</Script>
-				{children}
+				{unlocked ? children : <Suspense fallback={null}><AccessGate /></Suspense>}
 			</body>
 		</html>
 	);

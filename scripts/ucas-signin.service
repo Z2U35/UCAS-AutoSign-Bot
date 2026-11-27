@@ -1,0 +1,30 @@
+[Unit]
+Description=UCAS AutoSign Bot web service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ucas
+Group=ucas
+WorkingDirectory=/opt/ucas-autosign-bot
+Environment=NODE_ENV=production
+Environment=NEXT_TELEMETRY_DISABLED=1
+Environment=UCAS_CONFIG_PATH=/opt/ucas-autosign-bot/config/private.json
+Environment=UCAS_AUTO_SIGN_MODE=dry-run
+EnvironmentFile=-/etc/ucas-signin/auto-sign.env
+ExecStart=/usr/local/bin/node /opt/ucas-autosign-bot/node_modules/next/dist/bin/next start --hostname 127.0.0.1 --port 3000
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+StateDirectory=ucas-signin
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/ucas-autosign-bot/.next
+
+[Install]
+WantedBy=multi-user.target

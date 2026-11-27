@@ -1,0 +1,12 @@
+[Unit]
+Description=Check UCAS auto-sign due tasks every ten seconds
+
+[Timer]
+OnCalendar=*-*-* *:*:00/10
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=ucas-auto-sign.service
+
+[Install]
+WantedBy=timers.target

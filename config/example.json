@@ -1,0 +1,37 @@
+{
+  "access": {
+    "passwordHash": "GENERATED_BY_scripts/setup-access.mjs",
+    "sessionSecret": "GENERATED_BY_scripts/setup-access.mjs",
+    "secureCookies": true
+  },
+  "studentPassword": "replace-with-shared-student-password",
+  "wecom": {
+    "enabled": true,
+    "corpId": "ww_replace_with_corp_id",
+    "agentId": "1000002",
+    "corpSecret": "replace_with_app_secret",
+    "adminUserIds": [
+      "admin"
+    ],
+    "callbackToken": "replace_with_random_token",
+    "callbackEncodingAesKey": "replace_with_43_char_encoding_aes_key",
+    "webhookUrl": "",
+    "notifyOnSuccess": true,
+    "alwaysNotifyAdmin": false,
+    "fallbackAdminOnSuccess": false
+  },
+  "students": [
+    {
+      "id": "student-zhang",
+      "name": "zs",
+      "studentId": "202600000000001",
+      "wecomUserId": "zhangsan"
+    },
+    {
+      "id": "student-li",
+      "name": "ls",
+      "studentId": "202600000000002",
+      "wecomUserId": ""
+    }
+  ]
+}
